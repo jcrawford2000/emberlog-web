@@ -197,14 +197,15 @@ export default function EmberlogApp() {
           matchesAddress &&
           matchesUnit &&
           matchesChannel &&
-          matchesDate
+          matchesDate &&
+          page === 1
         ) {
           setIncidents((prev) => addIncidentDedupeCap(incoming, prev, pageSize));
         }
       },
     });
     return stop;
-  }, [typeFilter, query, unitFilter, channelFilter, fromFilter, toFilter, pageSize]);
+  }, [typeFilter, query, unitFilter, channelFilter, fromFilter, toFilter, page, pageSize]);
 
 
 
