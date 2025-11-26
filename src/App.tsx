@@ -153,13 +153,13 @@ export default function EmberlogApp() {
           !normalizedQuery ||
           incoming.address.toLowerCase().includes(normalizedQuery);
 
-        if (!matchesType || !matchesQuery) return;
+        if (!matchesType || !matchesQuery || page !== 1) return;
 
         setIncidents((prev) => addIncidentDedupeCap(incoming, prev, pageSize));
       },
     });
     return stop;
-  }, [typeFilter, query, pageSize]);
+  }, [typeFilter, query, page, pageSize]);
 
 
 
