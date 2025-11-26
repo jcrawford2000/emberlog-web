@@ -7,11 +7,12 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
-    allowedHosts: ['localhost','10.0.0.5'],
+    allowedHosts: ['localhost', '10.0.0.5', 'joshua', '10.0.0.25', 'joshua.pi-rack.com'],
+    port: 8000,
   },
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, 'src')
-    }
-  }
+      '@': path.resolve(__dirname, 'src'),
+    },
+  },
 });
