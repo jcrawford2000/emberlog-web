@@ -1,9 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { AudioLines, Filter, Info, MapPin, Search, Shield } from "lucide-react";
 import React, { useEffect, useMemo, useState } from "react";
+import { fetchIncidents } from "./api/emberlogApi";
 import { addIncidentDedupeCap } from "./lib/incidentList";
 import { openIncidentStream, type LiveState } from "./lib/sse";
-import type { Incident } from "./types/emberlogTypes";
+import { parseIncident, type Incident } from "./types/emberlogTypes";
 
 
 // --- Types -----------------------------------------------------------------
@@ -18,44 +19,6 @@ import type { Incident } from "./types/emberlogTypes";
 //  source_audio?: string; // URL/path
 //  transcript?: string;
 //};
-
-// --- Mock Data (replace with API later) ------------------------------------
-
-const MOCK: Incident[] = [
-  {
-    id: 101,
-    dispatched_at: "2025-09-29T02:18:45Z",
-    incident_type: "STRUCTURE FIRE",
-    address: "1234 W Camelback Rd, Phoenix, AZ",
-    units: ["E12", "L9", "R12", "BC1"],
-    channel: "PRWC G",
-    source_audio: "/audio/2025-09-29/101.wav",
-    transcript:
-      "E12, L9, R12, Battalion 1, respond to a reported structure fire, 1234 West Camelback Road.",
-  },
-  {
-    id: 102,
-    dispatched_at: "2025-09-29T03:05:09Z",
-    incident_type: "MEDICAL",
-    address: "2401 E Van Buren St, Phoenix, AZ",
-    units: ["R1", "E1"],
-    channel: "PRWC J",
-    source_audio: "/audio/2025-09-29/102.wav",
-    transcript:
-      "Rescue 1, Engine 1, respond to medical, 2401 East Van Buren Street, patient breathing difficulty.",
-  },
-  {
-    id: 103,
-    dispatched_at: "2025-09-29T04:22:12Z",
-    incident_type: "MVA",
-    address: "I-10 & 7th Ave, Phoenix, AZ",
-    units: ["E3", "R3"],
-    channel: "MCSO White Tanks",
-    source_audio: "/audio/2025-09-29/103.wav",
-    transcript:
-      "Engine 3, Rescue 3, motor vehicle accident, I-10 at 7th Avenue, two vehicles, unknown injuries.",
-  },
-];
 
 // --- Utilities -------------------------------------------------------------
 
@@ -76,27 +39,6 @@ function toLocalDisplay(iso: string) {
 
 function mapsLink(address: string) {
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
-}
-
-// --- API client stub -------------------------------------------------------
-
-async function fetchIncidents(query: string): Promise<Incident[]> {
-  await new Promise((r) => setTimeout(r, 200));
-  const q = query.trim().toLowerCase();
-  if (!q) return MOCK;
-  return MOCK.filter((i) => {
-    const hay = [
-      i.incident_type,
-      i.address,
-      i.channel,
-      i.units.join(" "),
-      i.transcript ?? "",
-      toLocalDisplay(i.dispatched_at),
-    ]
-      .join(" ")
-      .toLowerCase();
-    return hay.includes(q);
-  });
 }
 
 // --- Components ------------------------------------------------------------
@@ -138,48 +80,86 @@ function RowExpand({ incident }: { incident: Incident }) {
 export default function EmberlogApp() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
-  //const [results, setResults] = useState<Incident[]>(MOCK);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [typeFilter, setTypeFilter] = useState<string>("ALL");
-  const [ live, setLive ] = useState<LiveState>("connecting");
-  const [ incidents, setIncidents ] = useState<Incident[]>([]);
+  const [live, setLive] = useState<LiveState>("connecting");
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(50);
+  const [total, setTotal] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPage(1);
+  }, [typeFilter, query]);
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
-    fetchIncidents(query).then((data) => {
-      if (!active) return;
-      if (data) {
-        console.log("dummy")
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      const searchQuery = query.trim();
+      try {
+        const response = await fetchIncidents({
+          incident_type: typeFilter === "ALL" ? undefined : typeFilter,
+          address_search: searchQuery || undefined,
+          page,
+          page_size: pageSize,
+        });
+        if (!active) return;
+        setIncidents(response.items);
+        setTotal(response.total ?? null);
+      } catch (e) {
+        if (!active) return;
+        console.error("Failed to fetch incidents", e);
+        setError("Failed to load incidents. Please try again.");
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
       }
-      //setResults(data);
-      setLoading(false);
-    });
+    };
+
+    load();
     return () => {
       active = false;
     };
-  }, [query]);
+  }, [typeFilter, query, page, pageSize]);
 
   const incidentTypes = useMemo(() => {
     const s = new Set(incidents.map((r) => r.incident_type));
     return ["ALL", ...Array.from(s).sort()];
   }, [incidents]);
 
+  const totalPages = useMemo(() => {
+    if (!total) return null;
+    return Math.max(1, Math.ceil(total / pageSize));
+  }, [pageSize, total]);
+
   useEffect(() => {
     const stop = openIncidentStream({
       onStatus: setLive,
       onIncident: (json) => {
-        try {
-          const incoming = JSON.parse(json) as Incident;
-          setIncidents((prev) => addIncidentDedupeCap(incoming, prev, 200));
+        const incoming = parseIncident(json);
+        if (!incoming) {
+          console.warn("Bad incident JSON from SSE:", json);
+          return;
         }
-        catch (e) {
-          console.warn("Bad incident JSON from SSE:", e, json);
-        }
+
+        const normalizedQuery = query.trim().toLowerCase();
+        const matchesType =
+          typeFilter === "ALL" || incoming.incident_type === typeFilter;
+        const matchesQuery =
+          !normalizedQuery ||
+          incoming.address.toLowerCase().includes(normalizedQuery);
+
+        if (!matchesType || !matchesQuery) return;
+
+        setIncidents((prev) => addIncidentDedupeCap(incoming, prev, pageSize));
       },
     });
     return stop;
-  }, []);
+  }, [typeFilter, query, pageSize]);
 
 
 
@@ -241,12 +221,42 @@ export default function EmberlogApp() {
           </div>
         </div>
 
+        {error && (
+          <div className="rounded-xl border border-red-400/40 bg-red-900/30 px-4 py-3 text-sm text-red-100">
+            {error}
+          </div>
+        )}
+
         {/* Results Card */}
         <div className="card-surface overflow-hidden">
-          <div className="border-b border-border bg-alt/40 px-4 py-3 flex items-center justify-between">
+          <div className="border-b border-border bg-alt/40 px-4 py-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div className="font-semibold text-body">Latest Dispatches</div>
-            <div className="text-sm text-muted">
-              {loading ? "Loading…" : `${filtered.length} results`}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="text-sm text-muted">
+                {loading
+                  ? "Loading…"
+                  : `Showing ${filtered.length}${total ? ` of ${total}` : ""} incidents`}
+              </div>
+              <div className="flex items-center gap-2 text-sm text-muted">
+                <button
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/20 px-2 py-1 text-xs disabled:opacity-50"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page === 1 || loading}
+                >
+                  Previous
+                </button>
+                <span>
+                  Page {page}
+                  {total ? ` / ${totalPages}` : ""}
+                </span>
+                <button
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/20 px-2 py-1 text-xs disabled:opacity-50"
+                  onClick={() => setPage((p) => p + 1)}
+                  disabled={!!(totalPages && page >= totalPages) || loading}
+                >
+                  Next
+                </button>
+              </div>
             </div>
           </div>
 
