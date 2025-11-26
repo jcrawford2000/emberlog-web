@@ -1,10 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { AudioLines, Filter, Info, MapPin, Search, Shield } from "lucide-react";
 import React, { useEffect, useMemo, useState } from "react";
-import { fetchIncidents } from "./api/emberlogApi";
+import { fetchIncidents, type IncidentQueryParams } from "./api/emberlogApi";
 import { addIncidentDedupeCap } from "./lib/incidentList";
 import { openIncidentStream, type LiveState } from "./lib/sse";
-import { parseIncident, type Incident } from "./types/emberlogTypes";
+import { IncidentSchema, parseIncident, type Incident } from "./types/emberlogTypes";
 
 
 // --- Types -----------------------------------------------------------------
@@ -82,6 +82,10 @@ export default function EmberlogApp() {
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [typeFilter, setTypeFilter] = useState<string>("ALL");
+  const [unitFilter, setUnitFilter] = useState("");
+  const [channelFilter, setChannelFilter] = useState("");
+  const [fromFilter, setFromFilter] = useState<string | null>(null);
+  const [toFilter, setToFilter] = useState<string | null>(null);
   const [live, setLive] = useState<LiveState>("connecting");
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [page, setPage] = useState(1);
@@ -91,21 +95,27 @@ export default function EmberlogApp() {
 
   useEffect(() => {
     setPage(1);
-  }, [typeFilter, query]);
+  }, [typeFilter, query, unitFilter, channelFilter, fromFilter, toFilter]);
 
   useEffect(() => {
     let active = true;
     const load = async () => {
       setLoading(true);
       setError(null);
-      const searchQuery = query.trim();
       try {
-        const response = await fetchIncidents({
+        const params: IncidentQueryParams = {
           incident_type: typeFilter === "ALL" ? undefined : typeFilter,
-          address_search: searchQuery || undefined,
+          address_search: query.trim() || undefined,
+          channel: channelFilter.trim() || undefined,
+          units: unitFilter.trim() ? [unitFilter.trim()] : undefined,
+          from_dispatched_at: fromFilter
+            ? new Date(fromFilter).toISOString()
+            : undefined,
+          to_dispatched_at: toFilter ? new Date(toFilter).toISOString() : undefined,
           page,
           page_size: pageSize,
-        });
+        };
+        const response = await fetchIncidents(params);
         if (!active) return;
         setIncidents(response.items);
         setTotal(response.total ?? null);
@@ -124,7 +134,7 @@ export default function EmberlogApp() {
     return () => {
       active = false;
     };
-  }, [typeFilter, query, page, pageSize]);
+  }, [typeFilter, query, unitFilter, channelFilter, fromFilter, toFilter, page, pageSize]);
 
   const incidentTypes = useMemo(() => {
     const s = new Set(incidents.map((r) => r.incident_type));
@@ -140,26 +150,61 @@ export default function EmberlogApp() {
     const stop = openIncidentStream({
       onStatus: setLive,
       onIncident: (json) => {
-        const incoming = parseIncident(json);
+        let incoming: Incident | null = null;
+        try {
+          const parsed = JSON.parse(json);
+          const validated = IncidentSchema.safeParse(parsed);
+          incoming = validated.success
+            ? {
+                ...validated.data,
+                source_audio: validated.data.source_audio ?? undefined,
+                transcript: validated.data.transcript ?? undefined,
+              }
+            : null;
+        } catch (err) {
+          incoming = parseIncident(json);
+        }
+
         if (!incoming) {
           console.warn("Bad incident JSON from SSE:", json);
           return;
         }
 
-        const normalizedQuery = query.trim().toLowerCase();
         const matchesType =
           typeFilter === "ALL" || incoming.incident_type === typeFilter;
-        const matchesQuery =
-          !normalizedQuery ||
-          incoming.address.toLowerCase().includes(normalizedQuery);
+        const matchesAddress =
+          !query.trim() ||
+          (incoming.address ?? "").toLowerCase().includes(query.trim().toLowerCase());
+        const matchesUnit =
+          !unitFilter.trim() ||
+          (incoming.units ?? []).some((u) =>
+            u.toLowerCase().includes(unitFilter.trim().toLowerCase()),
+          );
+        const matchesChannel =
+          !channelFilter.trim() ||
+          (incoming.channel ?? "")
+            .toLowerCase()
+            .includes(channelFilter.trim().toLowerCase());
 
-        if (!matchesType || !matchesQuery || page !== 1) return;
+        let matchesDate = true;
+        const d = new Date(incoming.dispatched_at);
 
-        setIncidents((prev) => addIncidentDedupeCap(incoming, prev, pageSize));
+        if (fromFilter && d < new Date(fromFilter)) matchesDate = false;
+        if (toFilter && d > new Date(toFilter)) matchesDate = false;
+
+        if (
+          matchesType &&
+          matchesAddress &&
+          matchesUnit &&
+          matchesChannel &&
+          matchesDate
+        ) {
+          setIncidents((prev) => addIncidentDedupeCap(incoming, prev, pageSize));
+        }
       },
     });
     return stop;
-  }, [typeFilter, query, page, pageSize]);
+  }, [typeFilter, query, unitFilter, channelFilter, fromFilter, toFilter, pageSize]);
 
 
 
@@ -193,31 +238,69 @@ export default function EmberlogApp() {
       {/* Main Content */}
       <main className="mx-auto max-w-7xl px-4 py-6 space-y-6">
         {/* Search + Filters Row */}
-        <div className="grid gap-3 md:grid-cols-[1fr_auto]">
-          <div className="relative">
-            <Search aria-hidden className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-white/70" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search incident type, address, unit, channel, time…"
-              className="input-ember w-full px-10"
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="inline-flex items-center gap-2 rounded-xl bg-white/10 border border-white/20 px-3 py-2">
-              <Filter className="h-4 w-4" />
-              <select
-                className="bg-transparent focus:outline-none"
-                value={typeFilter}
-                onChange={(e) => setTypeFilter(e.target.value)}
-              >
-                {incidentTypes.map((t) => (
-                  <option key={t} value={t} className="text-body">
-                    {t}
-                  </option>
-                ))}
-              </select>
+        <div className="space-y-3">
+          <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+            <div className="relative">
+              <Search
+                aria-hidden
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-white/70"
+              />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search address / location"
+                className="input-ember w-full px-10"
+              />
             </div>
+            <div className="flex items-center gap-2">
+              <div className="inline-flex items-center gap-2 rounded-xl bg-white/10 border border-white/20 px-3 py-2">
+                <Filter className="h-4 w-4" />
+                <select
+                  className="bg-transparent focus:outline-none"
+                  value={typeFilter}
+                  onChange={(e) => setTypeFilter(e.target.value)}
+                >
+                  {incidentTypes.map((t) => (
+                    <option key={t} value={t} className="text-body">
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+            <input
+              value={unitFilter}
+              onChange={(e) => setUnitFilter(e.target.value)}
+              placeholder="Unit (e.g., E605)"
+              className="input-ember w-full"
+            />
+            <input
+              value={channelFilter}
+              onChange={(e) => setChannelFilter(e.target.value)}
+              placeholder="Channel"
+              className="input-ember w-full"
+            />
+            <label className="flex flex-col gap-1 text-sm text-muted">
+              <span>From</span>
+              <input
+                type="datetime-local"
+                value={fromFilter ?? ""}
+                onChange={(e) => setFromFilter(e.target.value || null)}
+                className="input-ember"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-sm text-muted">
+              <span>To</span>
+              <input
+                type="datetime-local"
+                value={toFilter ?? ""}
+                onChange={(e) => setToFilter(e.target.value || null)}
+                className="input-ember"
+              />
+            </label>
           </div>
         </div>
 
